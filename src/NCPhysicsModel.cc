@@ -26,12 +26,22 @@
 #include "NCrystal/internal/utils/NCMath.hh"
 #include "NCrystal/internal/utils/NCString.hh"
 #include "NCrystal/internal/vdos/NCVDOSEval.hh"
+#if NCRYSTAL_VERSION >= 4004007
+#include "NCrystal/internal/sab/NCSABFactory.hh"
+#endif
 
 #include <algorithm>
 #include <cmath>
 #include <complex>
 
 namespace {
+
+#if NCRYSTAL_VERSION >= 4004007
+  //VDOSEval moved to the NC::VDOS namespace in NCrystal 4.4.7:
+  using VDOSEval = NC::VDOS::VDOSEval;
+#else
+  using VDOSEval = NC::VDOSEval;
+#endif
 
   struct DirectGASpectrum {
     std::vector<double> energy_meV;
@@ -121,10 +131,30 @@ namespace {
     return spectrum;
   }
 
+#if NCRYSTAL_VERSION >= 4004007
+  // Effective temperature of a frequency spectrum f(E), E in meV, for the
+  // short collision time (SCT) extension of the kernel:
+  // Teff = <(E/2)coth(E/2kT)>_f / k (the E->0 limit of the bracket is kT).
+  static NC::Temperature effectiveTemperature(const DirectGASpectrum& s,
+                                              NC::Temperature temperature)
+  {
+    const double kt_meV = NC::constant_boltzmann * temperature.dbl() * 1000.0;
+    std::vector<double> g(s.energy_meV.size());
+    for (std::size_t i = 0; i < g.size(); ++i) {
+      const double x = s.energy_meV[i] / (2.0 * kt_meV);
+      g[i] = s.density_meV_inv[i] * kt_meV
+             * (x > 1.0e-8 ? x / std::tanh(x) : 1.0);
+    }
+    return NC::Temperature{ trapz(g, s.energy_meV)
+                            / trapz(s.density_meV_inv, s.energy_meV)
+                            / (NC::constant_boltzmann * 1000.0) };
+  }
+#endif
+
   // Convert NCrystal's normalized solid VDOS to the f(E) grid used by DirectGA.
   static DirectGASpectrum solidSpectrum(const NC::DI_VDOS& di_vdos)
   {
-    NC::VDOSEval vdos_eval(di_vdos.vdosData());
+    VDOSEval vdos_eval(di_vdos.vdosData());
     const auto grid = vdos_eval.getGridInfo();
     if (grid.npts_extended < 2 || !(grid.emax > 0.0))
       NCRYSTAL_THROW(BadInput,
@@ -253,10 +283,13 @@ namespace {
     return value * (1.0 + value * (0.5 + value / 6.0));
   }
 
+  // Builds the S(alpha,beta) kernel. For NCrystal >= 4.4.7, teff is also set to
+  // the effective temperature of the frequency spectrum.
   static NC::SABData buildDirectGASAB(const NCP::DirectGAInfo& input,
                                       const NC::DI_VDOS* di_vdos,
                                       const NC::AtomData& atom_data,
-                                      NC::Temperature temperature)
+                                      NC::Temperature temperature,
+                                      NC::Temperature& teff)
   {
     const double temperature_K = temperature.dbl();
     const double hbar_eV_ps = NC::constant_planck / NC::k2Pi * 1.0e12;
@@ -278,6 +311,14 @@ namespace {
     } else {
       spectrum = liquidSpectrum(input);
     }
+#if NCRYSTAL_VERSION >= 4004007
+    teff = ( input.solid
+             ? NC::Temperature{
+                 VDOSEval(di_vdos->vdosData()).calcEffectiveTemperature() }
+             : effectiveTemperature(spectrum, temperature) );
+#else
+    teff = temperature;
+#endif
 
     const double atom_mass =
         atom_data.averageMassAMU().dbl() * NC::constant_dalton2eVc2
@@ -479,7 +520,27 @@ bool NCP::PhysicsModel::isApplicable(const NC::Info& info)
   return info.countCustomSections("DIRECTGA") > 0;
 }
 
-NCP::PhysicsModel NCP::PhysicsModel::createFromInfo(const NC::Info& info)
+// Wraps a finished S(alpha,beta) in a scatter process. For NCrystal >= 4.4.7,
+// knllux is the luxury level of the kernel processing and teff the effective
+// temperature used by the short collision time (SCT) model extending the kernel
+// beyond its alpha-beta grid. Older NCrystal versions ignore both.
+static NC::ProcImpl::ProcPtr makeSABScatterProc( NC::SABData&& sabdata,
+                                                 int knllux,
+                                                 NC::Temperature teff )
+{
+#if NCRYSTAL_VERSION >= 4004007
+  auto sabdata_so = NC::makeSO<const NC::SABData>( std::move(sabdata) );
+  auto sabext = NC::SAB::createSABExtendedNoCache( knllux, sabdata_so, teff );
+  return NC::makeSO<NC::SABScatter>( std::move(sabext), sabdata_so->boundXS() );
+#else
+  (void)knllux;
+  (void)teff;
+  return NC::makeSO<NC::SABScatter>( std::move(sabdata) );
+#endif
+}
+
+NCP::PhysicsModel NCP::PhysicsModel::createFromInfo(const NC::Info& info,
+                                                    int knllux)
 {
   const auto section_count = info.countCustomSections("DIRECTGA");
   if (section_count != 1)
@@ -788,12 +849,12 @@ NCP::PhysicsModel NCP::PhysicsModel::createFromInfo(const NC::Info& info)
     }
   }
 
-  return PhysicsModel(std::move(input_data), info);
+  return PhysicsModel(std::move(input_data), info, knllux);
 }
 
 NCP::PhysicsModel::PhysicsModel(
     std::unordered_map<std::string, DirectGAInfo> input_data,
-    const NC::Info& info)
+    const NC::Info& info, int knllux)
   : m_direct_ga_data(std::move(input_data))
 {
   NC::ProcImpl::ProcComposition::ComponentList components;
@@ -810,13 +871,14 @@ NCP::PhysicsModel::PhysicsModel(
     }
 
     const auto* di_vdos = dynamic_cast<const NC::DI_VDOS*>(di.get());
+    NC::Temperature teff = di->temperature();
     auto sab = buildDirectGASAB(input_it->second, di_vdos,
-                                di->atomData(), di->temperature());
+                                di->atomData(), di->temperature(), teff);
     if (usesYKSkoldCorrection(input_it->second.corrections))
       sab = applyYKSkold(sab, di->atomData(),
                          input_it->second.corrections);
     components.push_back({di->fraction(),
-                          NC::makeSO<NC::SABScatter>(std::move(sab))});
+                          makeSABScatterProc(std::move(sab), knllux, teff)});
   }
 
   auto process = NC::ProcImpl::ProcComposition::consumeAndCombine(

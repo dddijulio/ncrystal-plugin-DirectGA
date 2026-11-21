@@ -83,7 +83,12 @@ NCP::PluginFactory::query( const NC::FactImpl::ScatterRequest& cfg ) const
 NC::ProcImpl::ProcPtr
 NCP::PluginFactory::produce( const NC::FactImpl::ScatterRequest& cfg ) const
 {
+#if NCRYSTAL_VERSION >= 4004007
+  auto physics_model = PhysicsModel::createFromInfo( cfg.info(),
+                                                     cfg.get_knllux() );
+#else
   auto physics_model = PhysicsModel::createFromInfo( cfg.info() );
+#endif
   const bool keep_standard_elastic = physics_model.usesSolid();
   auto sc_ourmodel
     = NC::makeSO<PluginScatter>( std::move(physics_model) );
