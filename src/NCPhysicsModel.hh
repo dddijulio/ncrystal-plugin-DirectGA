@@ -42,10 +42,11 @@ namespace NCPluginNamespace {
   class PhysicsModel final : public NC::MoveOnly {
   public:
     static bool isApplicable( const NC::Info& );
-    static PhysicsModel createFromInfo( const NC::Info& );
+    //knllux is only used with NCrystal >= 4.4.7:
+    static PhysicsModel createFromInfo( const NC::Info&, int knllux = 3 );
 
     PhysicsModel( std::unordered_map<std::string, DirectGAInfo>,
-                  const NC::Info& );
+                  const NC::Info&, int knllux = 3 );
 
     bool usesSolid() const noexcept;
     double calcCrossSection( NC::CachePtr&, double neutron_ekin ) const;
